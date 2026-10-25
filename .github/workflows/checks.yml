@@ -1,0 +1,61 @@
+#
+#  checks.yml
+#  SimpleBCM
+#
+#  Created by laobamac on 2026/9/23.
+#  Copyright © 2026 laobamac. All rights reserved.
+#
+name: Source checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Validate source metadata
+        run: |
+          python3 - <<'PY'
+          import ast
+          import json
+          import plistlib
+          import re
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          for path in Path('Tools').glob('*.py'):
+              ast.parse(path.read_text(), filename=str(path))
+          for path in Path('Docs').glob('*.json'):
+              json.loads(path.read_text())
+          for path in Path('SimpleBCM').glob('*.plist'):
+              plistlib.loads(path.read_bytes())
+          for path in Path('SimpleBCM.xcodeproj').rglob('*.xcscheme'):
+              ET.parse(path)
+
+          version = re.search(r'^MODULE_VERSION\s*=\s*(\S+)', Path('Config/Kernel.xcconfig').read_text(), re.M).group(1)
+          package = ast.parse(Path('Tools/package.py').read_text())
+          package_version = next(ast.literal_eval(node.value) for node in package.body
+                                 if isinstance(node, ast.Assign)
+                                 and any(isinstance(target, ast.Name) and target.id == 'VERSION' for target in node.targets))
+          assert version == package_version, 'Driver and package versions differ'
+          for name in ['README.md', 'README.en.md']:
+              assert f'version-{version}-' in Path(name).read_text(), name
+          print('Source metadata and version checks passed.')
+          PY
+      - name: Validate configuration generation and migration
+        run: python3 Tools/verify_configuration.py

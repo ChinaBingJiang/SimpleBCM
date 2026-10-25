@@ -1,0 +1,141 @@
+#
+#  build.yml
+#  SimpleBCM
+#
+#  Created by laobamac on 2026/9/25.
+#  Copyright © 2026 laobamac. All rights reserved.
+#
+name: Build and Publish
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: simplebcm-${{ github.event_name == 'push' && 'pre' || github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    if: github.event_name != 'release' || github.event.release.prerelease == false
+    runs-on: macos-26-intel
+    timeout-minutes: 30
+    outputs:
+      channel: ${{ steps.channel.outputs.value }}
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Choose channel
+        id: channel
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT_NAME" == release ]]; then
+            echo 'value=rel' >> "$GITHUB_OUTPUT"
+          else
+            echo 'value=pre' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Check formal version
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'Tools')
+          from package import VERSION
+          if os.environ['RELEASE_TAG'] not in (VERSION, f'v{VERSION}'):
+              raise SystemExit('Release tag must match Config/Kernel.xcconfig and package version')
+          PY
+      - name: Show toolchain
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcrun --show-sdk-version
+      - name: Build and validate Debug
+        run: python3 Tools/build.py --configuration Debug
+      - name: Build and validate Release
+        run: python3 Tools/build.py --configuration Release
+      - name: Analyze Release
+        run: python3 Tools/build.py --configuration Release --analyze
+      - name: Package
+        env:
+          CHANNEL: ${{ steps.channel.outputs.value }}
+        run: python3 Tools/package.py --channel "$CHANNEL"
+      - name: Validate package layout and hashes
+        env:
+          CHANNEL: ${{ steps.channel.outputs.value }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, sys, zipfile
+          from pathlib import Path
+          sys.path.insert(0, 'Tools')
+          from package import package_name
+          name = package_name(os.environ['CHANNEL'])
+          path = Path('dist') / (name + '.zip')
+          assert path.with_name(path.name + '.sha256').read_text().split() == [hashlib.sha256(path.read_bytes()).hexdigest(), path.name]
+          with zipfile.ZipFile(path) as archive:
+              assert archive.testzip() is None
+              paths = {p.removeprefix(name + '/') for p in archive.namelist()}
+              assert {p.split('/')[0] for p in paths} == {'EFI', 'Debug', 'Release', 'Extra', 'config.fragment.plist'}
+              manifest = json.loads(archive.read(name + '/Extra/manifest.json'))
+              assert paths == set(manifest['files']) | {'Extra/manifest.json'}
+              assert manifest['driverLoading'] == 'external'
+              assert len(manifest['bundles']) == 5
+              for relative, digest in manifest['files'].items():
+                  assert hashlib.sha256(archive.read(name + '/' + relative)).hexdigest() == digest, relative
+              assert archive.read(name + '/Release/SimpleBCM.kext/Contents/MacOS/SimpleBCM') == archive.read(name + '/EFI/OC/Kexts/SimpleBCM.kext/Contents/MacOS/SimpleBCM')
+          print('Package layout and all file hashes verified.')
+          PY
+      - name: Upload packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: SimpleBCM
+          path: |
+            dist/SimpleBCM-*.zip
+            dist/SimpleBCM-*.zip.sha256
+          if-no-files-found: error
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: build-logs
+          path: |
+            build/*.log
+            build/Validation-*.json
+            build/DependencySymbols-*.json
+          if-no-files-found: ignore
+  publish:
+    needs: build
+    if: github.event_name == 'push' || github.event_name == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Download packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: SimpleBCM
+          path: dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ needs.build.outputs.channel }}
+        run: python3 Tools/publish.py --channel "$CHANNEL"
