@@ -72,7 +72,7 @@ static void initialize() {
 PluginConfiguration ADDPR(config) {
     xStringify(PRODUCT_NAME),
     parseModuleVersion(xStringify(MODULE_VERSION)),
-    LiluAPI::AllowNormal,
+    LiluAPI::AllowNormal | LiluAPI::AllowInstallerRecovery,
     disableArgs, arrsize(disableArgs),
     debugArgs, arrsize(debugArgs),
     nullptr, 0,
