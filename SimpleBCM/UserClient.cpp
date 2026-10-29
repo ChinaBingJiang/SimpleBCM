@@ -313,6 +313,9 @@ IOReturn IO80211APIUserClient::runCommand(IOExternalMethodArguments *arguments, 
     legacy.request.length = static_cast<uint32_t>(get ? outputSize : header->length);
     if (scanResult && !bcm::prepareScanResult(legacy.request, shadow, capacity))
         goto done;
+    if (set && request == bcm::ScanMultipleRequest && header->length == bcm::NativeScanMultipleSize &&
+        !bcm::prepareScanMultiple(legacy.request, shadow, capacity))
+        goto done;
     if (associate && header->length == bcm::NativeAssociateSize &&
         !bcm::prepareAssociate(legacy.request, shadow, capacity))
         goto done;

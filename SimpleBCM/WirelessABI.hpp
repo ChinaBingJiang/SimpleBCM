@@ -23,6 +23,9 @@ constexpr size_t EventCapacity = 0x4000;
 constexpr size_t MaximumEventPayload = 0x1000;
 constexpr uint32_t EventNotification = 0xE00002D5;
 constexpr uint32_t ScanResultRequest = 11;
+constexpr uint32_t ScanMultipleRequest = 86;
+constexpr size_t LegacyScanMultipleSize = 0x14E0;
+constexpr size_t NativeScanMultipleSize = 0x14E8;
 constexpr uint32_t CardCapabilitiesRequest = 12;
 constexpr uint32_t ScanDoneEvent = 10;
 constexpr uint32_t DriverAvailableEvent = 0x37;
@@ -151,6 +154,21 @@ inline uint32_t readUInt32(const uint8_t *buffer) {
 inline void writeUInt32(uint8_t *buffer, uint32_t value) {
     for (size_t index = 0; index < sizeof(value); ++index)
         buffer[index] = static_cast<uint8_t>(value >> (index * 8));
+}
+
+inline bool prepareScanMultiple(Request &request, uint8_t *buffer, size_t capacity) {
+    if (!buffer || capacity < NativeScanMultipleSize || request.length != NativeScanMultipleSize ||
+        readUInt32(buffer) != 1 || readUInt32(buffer + 8) > 10 ||
+        readUInt32(buffer + 0x19C) > 16 || readUInt32(buffer + 0x210) > 400)
+        return false;
+    for (size_t index = 0; index < readUInt32(buffer + 8); ++index) {
+        if (readUInt32(buffer + 0x10 + index * 0x28) > 32)
+            return false;
+    }
+    for (size_t offset = LegacyScanMultipleSize; offset < NativeScanMultipleSize; ++offset)
+        buffer[offset] = 0;
+    request.length = LegacyScanMultipleSize;
+    return true;
 }
 
 inline bool encodePowerAvailability(const uint8_t *power, size_t length,
