@@ -94,6 +94,7 @@ static PerformCommand classicCommand;
 static DriverPowerState driverPowerState;
 static EnableInterface legacyEnable;
 static SetPoweredOnByUser classicSetPoweredOn;
+static EnableInterface driverEnable;
 
 static const char *legacyPaths[] = {"/System/Library/Extensions/IO80211FamilyLegacy.kext/Contents/MacOS/IO80211FamilyLegacy"};
 static const char *skywalkPaths[] = {"/System/Library/Extensions/IOSkywalkFamily.kext/Contents/MacOS/IOSkywalkFamily"};
@@ -231,16 +232,13 @@ void Bridge::powerUp(const Endpoint &endpoint) {
     auto flag = OSDynamicCast(OSBoolean, controller->getProperty("TruePowerOff"));
     const bool coldOff = flag && flag->getValue();
 
-    // The legacy radio start is gated by IO80211Interface::poweredOnByUser.
-    // IO80211Controller::enable() checks that flag first and, while it is
-    // false, returns after merely setting enabledBySystem - which is exactly
-    // why the controller reports IOControllerEnabled = Yes while the radio
-    // never comes up. The new stack only ever touches the Skywalk interface,
-    // so nothing ever sets the classic flag; do it here.
     IOService *classic = endpoint.interface;
     if (!classic || !classic->metaCast("IO80211Interface"))
         classic = findClassicInterface(controller);
 
+    // Step one: raise the PCIe power state. IOService::setPowerState() is
+    // asynchronous, so the radio start below is deferred to a later client
+    // creation - by then the controller is already sitting in D0.
     if (coldOff && driverPowerState) {
         const IOReturn result = driverPowerState(controller, 2, controller);
         SYSLOG("bridge", "driver setPowerState(2) on %s -> 0x%x", endpoint.name, result);
@@ -251,18 +249,29 @@ void Bridge::powerUp(const Endpoint &endpoint) {
     if (!classic)
         return;
 
-    if (classicSetPoweredOn) {
+    // Step two: this is the entry point macOS itself uses when the user flips
+    // the Wi-Fi switch. The virtual slot resolves to AirPort_BrcmNIC::enable,
+    // the Broadcom override that actually starts the radio - its log tag is
+    // "AirPort_Brcm43xx::enable: _up[%d]". Calling the base implementation
+    // IO80211Controller::enable() is *not* equivalent: that one only sets
+    // enabledBySystem and issues an 80211 power request which, when it fails,
+    // drops the controller straight back to D0.
+    //
+    // setPoweredOnByUser() collapses repeated calls into a no-op once the flag
+    // matches, so a failed attempt is reset afterwards - otherwise the very
+    // first try (which may run before the asynchronous setPowerState() above
+    // has reached D0) would latch the flag and nothing would ever retry.
+    if (classicSetPoweredOn)
         classicSetPoweredOn(classic, true);
-        SYSLOG("bridge", "setPoweredOnByUser(true) on %s", endpoint.name);
-    } else {
-        SYSLOG("bridge", "setPoweredOnByUser symbol unavailable for %s", endpoint.name);
-    }
 
-    if (legacyEnable) {
+    if (driverEnable) {
+        const IOReturn result = driverEnable(controller, classic);
+        SYSLOG("bridge", "driver enable(%s) -> 0x%x", endpoint.name, result);
+        if (result != kIOReturnSuccess && classicSetPoweredOn)
+            classicSetPoweredOn(classic, false);
+    } else if (legacyEnable) {
         const IOReturn result = legacyEnable(controller, classic);
         SYSLOG("bridge", "legacy enable(%s) -> 0x%x", endpoint.name, result);
-    } else {
-        SYSLOG("bridge", "legacy enable symbol unavailable for %s", endpoint.name);
     }
 }
 
@@ -690,6 +699,9 @@ void Bridge::patchKext(void *, KernelPatcher &patcher, size_t index, mach_vm_add
         }
         driverPowerState = reinterpret_cast<DriverPowerState>(patcher.solveSymbol(index, "__ZN15AirPort_BrcmNIC13setPowerStateEmP9IOService"));
         if (!driverPowerState)
+            patcher.clearError();
+        driverEnable = reinterpret_cast<EnableInterface>(patcher.solveSymbol(index, "__ZN15AirPort_BrcmNIC6enableEP18IONetworkInterface"));
+        if (!driverEnable)
             patcher.clearError();
         __atomic_fetch_or(&state, 4U, __ATOMIC_RELEASE);
     }
