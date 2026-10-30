@@ -75,6 +75,7 @@ using BSDName = const char *(*)(IOService *);
 using PerformCommand = int (*)(IOService *, IOService *, unsigned long, void *, void *);
 using DriverPowerState = IOReturn (*)(IOService *, unsigned long, IOService *);
 using EnableInterface = IOReturn (*)(IOService *, IOService *);
+using SetPoweredOnByUser = void (*)(IOService *, bool);
 
 static NewClient originalClassicClient;
 static NewClient originalVirtualClient;
@@ -92,6 +93,7 @@ static BSDName skywalkName;
 static PerformCommand classicCommand;
 static DriverPowerState driverPowerState;
 static EnableInterface legacyEnable;
+static SetPoweredOnByUser classicSetPoweredOn;
 
 static const char *legacyPaths[] = {"/System/Library/Extensions/IO80211FamilyLegacy.kext/Contents/MacOS/IO80211FamilyLegacy"};
 static const char *skywalkPaths[] = {"/System/Library/Extensions/IOSkywalkFamily.kext/Contents/MacOS/IOSkywalkFamily"};
@@ -227,25 +229,39 @@ void Bridge::powerUp(const Endpoint &endpoint) {
     // Only act while the chip still reports itself as completely powered off,
     // so repeated user client creations collapse into a single attempt.
     auto flag = OSDynamicCast(OSBoolean, controller->getProperty("TruePowerOff"));
-    if (!flag || !flag->getValue())
-        return;
+    const bool coldOff = flag && flag->getValue();
 
-    if (driverPowerState) {
-        const IOReturn result = driverPowerState(controller, 2, controller);
-        SYSLOG("bridge", "driver setPowerState(2) on %s -> 0x%x", endpoint.name, result);
-        if (result == kIOReturnSuccess) {
-            __atomic_fetch_add(&counters.powerAvailabilityEvents, 1ULL, __ATOMIC_RELAXED);
-            return;
-        }
-    }
-
+    // The legacy radio start is gated by IO80211Interface::poweredOnByUser.
+    // IO80211Controller::enable() checks that flag first and, while it is
+    // false, returns after merely setting enabledBySystem - which is exactly
+    // why the controller reports IOControllerEnabled = Yes while the radio
+    // never comes up. The new stack only ever touches the Skywalk interface,
+    // so nothing ever sets the classic flag; do it here.
     IOService *classic = endpoint.interface;
     if (!classic || !classic->metaCast("IO80211Interface"))
         classic = findClassicInterface(controller);
-    if (classic && legacyEnable) {
+
+    if (coldOff && driverPowerState) {
+        const IOReturn result = driverPowerState(controller, 2, controller);
+        SYSLOG("bridge", "driver setPowerState(2) on %s -> 0x%x", endpoint.name, result);
+        if (result == kIOReturnSuccess)
+            __atomic_fetch_add(&counters.powerAvailabilityEvents, 1ULL, __ATOMIC_RELAXED);
+    }
+
+    if (!classic)
+        return;
+
+    if (classicSetPoweredOn) {
+        classicSetPoweredOn(classic, true);
+        SYSLOG("bridge", "setPoweredOnByUser(true) on %s", endpoint.name);
+    } else {
+        SYSLOG("bridge", "setPoweredOnByUser symbol unavailable for %s", endpoint.name);
+    }
+
+    if (legacyEnable) {
         const IOReturn result = legacyEnable(controller, classic);
         SYSLOG("bridge", "legacy enable(%s) -> 0x%x", endpoint.name, result);
-    } else if (!legacyEnable) {
+    } else {
         SYSLOG("bridge", "legacy enable symbol unavailable for %s", endpoint.name);
     }
 }
@@ -626,6 +642,9 @@ void Bridge::patchKext(void *, KernelPatcher &patcher, size_t index, mach_vm_add
         classicCommand = reinterpret_cast<PerformCommand>(patcher.solveSymbol(index, "__ZN16IO80211Interface14performCommandEP19IONetworkControllermPvS2_"));
         legacyEnable = reinterpret_cast<EnableInterface>(patcher.solveSymbol(index, "__ZN17IO80211Controller6enableEP18IONetworkInterface"));
         if (!legacyEnable)
+            patcher.clearError();
+        classicSetPoweredOn = reinterpret_cast<SetPoweredOnByUser>(patcher.solveSymbol(index, "__ZN16IO80211Interface18setPoweredOnByUserEb"));
+        if (!classicSetPoweredOn)
             patcher.clearError();
         if (!getRequest || !setRequest || !classicController || !virtualController || !classicName || !virtualName || !skywalkName || !classicCommand) {
             patcher.clearError();
