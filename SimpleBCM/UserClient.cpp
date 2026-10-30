@@ -53,7 +53,9 @@ IOReturn IO80211APIUserClient::create(IOService *provider, task_t task, void *to
             // every register access fails with EPWROFF (0x52). Raise a private
             // power demand here so IOPower drives the controller into its
             // working state before the stack retries its commands.
-            client->endpoint.controller->changePowerStateToPriv(1);
+            // The controller reports MaxPowerState = 2 (0 = off, 1 = doze,
+            // 2 = D0), so ask for the highest ordinal.
+            client->endpoint.controller->changePowerStateToPriv(2);
             __atomic_fetch_add(&bcm::counters.opens, 1ULL, __ATOMIC_RELAXED);
             *result = client;
             return kIOReturnSuccess;
