@@ -14,6 +14,8 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOWorkLoop.h>
 #include <libkern/c++/OSData.h>
+#include <libkern/c++/OSBoolean.h>
+#include <libkern/c++/OSIterator.h>
 #include <kern/clock.h>
 #include <mach/mach_time.h>
 #include <kern/thread_call.h>
@@ -71,6 +73,8 @@ using Ioctl = int (*)(IOService *, IOService *, IOService *, IOService *, void *
 using Controller = IOService *(*)(IOService *);
 using BSDName = const char *(*)(IOService *);
 using PerformCommand = int (*)(IOService *, IOService *, unsigned long, void *, void *);
+using DriverPowerState = IOReturn (*)(IOService *, unsigned long, IOService *);
+using EnableInterface = IOReturn (*)(IOService *, IOService *);
 
 static NewClient originalClassicClient;
 static NewClient originalVirtualClient;
@@ -86,6 +90,8 @@ static BSDName classicName;
 static BSDName virtualName;
 static BSDName skywalkName;
 static PerformCommand classicCommand;
+static DriverPowerState driverPowerState;
+static EnableInterface legacyEnable;
 
 static const char *legacyPaths[] = {"/System/Library/Extensions/IO80211FamilyLegacy.kext/Contents/MacOS/IO80211FamilyLegacy"};
 static const char *skywalkPaths[] = {"/System/Library/Extensions/IOSkywalkFamily.kext/Contents/MacOS/IOSkywalkFamily"};
@@ -193,6 +199,55 @@ bool Bridge::identify(IOService *interface, InterfaceKind kind, Endpoint &endpoi
     endpoint.kind = kind;
     strlcpy(endpoint.name, name, sizeof(endpoint.name));
     return true;
+}
+
+static IOService *findClassicInterface(IOService *controller) {
+    if (!controller)
+        return nullptr;
+    OSIterator *iterator = controller->getChildIterator(gIOServicePlane);
+    if (!iterator)
+        return nullptr;
+    IOService *found = nullptr;
+    while (!found) {
+        OSObject *entry = iterator->getNextObject();
+        if (!entry)
+            break;
+        auto service = OSDynamicCast(IOService, entry);
+        if (service && service->metaCast("IO80211Interface"))
+            found = service;
+    }
+    iterator->release();
+    return found;
+}
+
+void Bridge::powerUp(const Endpoint &endpoint) {
+    IOService *controller = endpoint.controller;
+    if (!controller)
+        return;
+    // Only act while the chip still reports itself as completely powered off,
+    // so repeated user client creations collapse into a single attempt.
+    auto flag = OSDynamicCast(OSBoolean, controller->getProperty("TruePowerOff"));
+    if (!flag || !flag->getValue())
+        return;
+
+    if (driverPowerState) {
+        const IOReturn result = driverPowerState(controller, 2, controller);
+        SYSLOG("bridge", "driver setPowerState(2) on %s -> 0x%x", endpoint.name, result);
+        if (result == kIOReturnSuccess) {
+            __atomic_fetch_add(&counters.powerAvailabilityEvents, 1ULL, __ATOMIC_RELAXED);
+            return;
+        }
+    }
+
+    IOService *classic = endpoint.interface;
+    if (!classic || !classic->metaCast("IO80211Interface"))
+        classic = findClassicInterface(controller);
+    if (classic && legacyEnable) {
+        const IOReturn result = legacyEnable(controller, classic);
+        SYSLOG("bridge", "legacy enable(%s) -> 0x%x", endpoint.name, result);
+    } else if (!legacyEnable) {
+        SYSLOG("bridge", "legacy enable symbol unavailable for %s", endpoint.name);
+    }
 }
 
 static IOReturn newClassicClient(IOService *self, task_t task, void *token, uint32_t type,
@@ -569,6 +624,9 @@ void Bridge::patchKext(void *, KernelPatcher &patcher, size_t index, mach_vm_add
         virtualName = reinterpret_cast<BSDName>(patcher.solveSymbol(index, "__ZN23IO80211VirtualInterface10getBSDNameEv"));
         skywalkName = reinterpret_cast<BSDName>(patcher.solveSymbol(index, "__ZN23IO80211SkywalkInterface10getBSDNameEv"));
         classicCommand = reinterpret_cast<PerformCommand>(patcher.solveSymbol(index, "__ZN16IO80211Interface14performCommandEP19IONetworkControllermPvS2_"));
+        legacyEnable = reinterpret_cast<EnableInterface>(patcher.solveSymbol(index, "__ZN17IO80211Controller6enableEP18IONetworkInterface"));
+        if (!legacyEnable)
+            patcher.clearError();
         if (!getRequest || !setRequest || !classicController || !virtualController || !classicName || !virtualName || !skywalkName || !classicCommand) {
             patcher.clearError();
             reject("LegacySymbolsMissing");
@@ -611,6 +669,9 @@ void Bridge::patchKext(void *, KernelPatcher &patcher, size_t index, mach_vm_add
             reject("AirPortCopyRoutingFailed");
             return;
         }
+        driverPowerState = reinterpret_cast<DriverPowerState>(patcher.solveSymbol(index, "__ZN15AirPort_BrcmNIC13setPowerStateEmP9IOService"));
+        if (!driverPowerState)
+            patcher.clearError();
         __atomic_fetch_or(&state, 4U, __ATOMIC_RELEASE);
     }
     if (ready()) {

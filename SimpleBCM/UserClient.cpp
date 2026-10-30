@@ -56,6 +56,11 @@ IOReturn IO80211APIUserClient::create(IOService *provider, task_t task, void *to
             // The controller reports MaxPowerState = 2 (0 = off, 1 = doze,
             // 2 = D0), so ask for the highest ordinal.
             client->endpoint.controller->changePowerStateToPriv(2);
+            // The private demand alone does not make IOPower run the driver's
+            // power transition, so drive the legacy power machine directly:
+            // first the BrcmNIC setPowerState() implementation, and if that
+            // refuses, IO80211Controller::enable() on the classic interface.
+            bcm::Bridge::powerUp(client->endpoint);
             __atomic_fetch_add(&bcm::counters.opens, 1ULL, __ATOMIC_RELAXED);
             *result = client;
             return kIOReturnSuccess;
@@ -100,10 +105,17 @@ void IO80211APIUserClient::close() {
         registered = false;
         bcm::Bridge::removeClient(this);
     }
-    // Drop the private power demand raised in create() so the controller is
-    // allowed to return to its idle state once the last client is gone.
-    if (endpoint.controller)
-        endpoint.controller->changePowerStateToPriv(0);
+    // Deliberately do not drop the power demand while the chip is up. The
+    // stack opens and closes these clients while probing the card; releasing
+    // the demand on every close powered the chip straight back down and the
+    // radio start was cancelled, which is what made the Wi-Fi switch flip
+    // itself off again. Only release when the driver already reports the chip
+    // as powered off.
+    if (endpoint.controller) {
+        auto flag = OSDynamicCast(OSBoolean, endpoint.controller->getProperty("TruePowerOff"));
+        if (flag && flag->getValue())
+            endpoint.controller->changePowerStateToPriv(0);
+    }
 }
 
 IOReturn IO80211APIUserClient::closeAction(OSObject *owner, void *, void *, void *, void *) {

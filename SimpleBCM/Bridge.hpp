@@ -72,6 +72,7 @@ public:
     static int refreshAvailability(const Endpoint &endpoint);
     static bool isScalarGet(uint32_t request);
     static bool identify(IOService *interface, InterfaceKind kind, Endpoint &endpoint);
+    static void powerUp(const Endpoint &endpoint);
     static bool addClient(IO80211APIUserClient *client);
     static void removeClient(IO80211APIUserClient *client);
     static int command(const Endpoint &endpoint, bool set, LegacyRequest &request, void *shadow, size_t size);
